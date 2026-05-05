@@ -1,95 +1,136 @@
 import pandas as pd
+import numpy as np
 import torch
-
-from dataset_loader import load_data
-from preprocess import clean_text
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, f1_score
 
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    Trainer,
-    TrainingArguments
+    TrainingArguments,
+    Trainer
 )
 
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, f1_score
+from dataset_loader import load_data
+from preprocess import clean_text
 
-# 🔹 Load dataset
+
+# =========================
+# 1. LOAD DATA
+# =========================
 train_df, dev_df, test_df = load_data()
 
-# 🔹 Clean text
+# Your dataset uses 'class_label'
+train_df = train_df.rename(columns={"class_label": "label"})
+dev_df   = dev_df.rename(columns={"class_label": "label"})
+test_df  = test_df.rename(columns={"class_label": "label"})
+
+
+# =========================
+# 2. REMOVE NEUTRAL (BINARY)
+# =========================
+train_df = train_df[train_df['label'] != 'Neutral']
+dev_df   = dev_df[dev_df['label'] != 'Neutral']
+test_df  = test_df[test_df['label'] != 'Neutral']
+
+
+# =========================
+# 3. CLEAN TEXT
+# =========================
 train_df['text'] = train_df['text'].apply(clean_text)
 dev_df['text']   = dev_df['text'].apply(clean_text)
 test_df['text']  = test_df['text'].apply(clean_text)
 
-# 🔹 Encode labels
+
+# =========================
+# 4. LABEL ENCODING
+# =========================
 le = LabelEncoder()
-train_df['label'] = le.fit_transform(train_df['class_label'])
-dev_df['label']   = le.transform(dev_df['class_label'])
-test_df['label']  = le.transform(test_df['class_label'])
 
-# 🔹 Tokenizer
-tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
+train_df['label'] = le.fit_transform(train_df['label'])
+dev_df['label']   = le.transform(dev_df['label'])
+test_df['label']  = le.transform(test_df['label'])
 
-def tokenize(texts):
+print("Label mapping:", dict(zip(le.classes_, le.transform(le.classes_))))
+
+
+# =========================
+# 5. MODEL + TOKENIZER
+# =========================
+MODEL_NAME = "csebuetnlp/banglabert"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=2
+)
+
+
+# =========================
+# 6. TOKENIZATION
+# =========================
+def tokenize_batch(batch):
     return tokenizer(
-        texts.tolist(),
+        batch["text"],
         truncation=True,
-        padding=True,
+        padding="max_length",
         max_length=128
     )
 
-train_encodings = tokenize(train_df['text'])
-dev_encodings   = tokenize(dev_df['text'])
-test_encodings  = tokenize(test_df['text'])
 
-# 🔹 Dataset class
-class SentimentDataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
+# =========================
+# 7. CONVERT TO HF DATASET
+# =========================
+from datasets import Dataset
 
-    def __getitem__(self, idx):
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        item['labels'] = torch.tensor(self.labels[idx])
-        return item
+train_dataset = Dataset.from_pandas(train_df[['text', 'label']])
+dev_dataset   = Dataset.from_pandas(dev_df[['text', 'label']])
+test_dataset  = Dataset.from_pandas(test_df[['text', 'label']])
 
-    def __len__(self):
-        return len(self.labels)
+train_dataset = train_dataset.map(tokenize_batch, batched=True)
+dev_dataset   = dev_dataset.map(tokenize_batch, batched=True)
+test_dataset  = test_dataset.map(tokenize_batch, batched=True)
 
-train_dataset = SentimentDataset(train_encodings, train_df['label'].values)
-dev_dataset   = SentimentDataset(dev_encodings, dev_df['label'].values)
-test_dataset  = SentimentDataset(test_encodings, test_df['label'].values)
+train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+dev_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+test_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-# 🔹 Model
-model = AutoModelForSequenceClassification.from_pretrained(
-    "bert-base-multilingual-cased",
-    num_labels=3
-)
 
-# 🔹 Training config
+# =========================
+# 8. METRICS
+# =========================
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1": f1_score(labels, preds)
+    }
+
+
+# =========================
+# 9. TRAINING CONFIG
+# =========================
 training_args = TrainingArguments(
-    output_dir="../results",
+    output_dir="./results",
     learning_rate=2e-5,
     per_device_train_batch_size=16,
     per_device_eval_batch_size=16,
-    num_train_epochs=3,
-    evaluation_strategy="epoch",
+    num_train_epochs=4,
+    weight_decay=0.01,
+    eval_strategy="epoch",
     save_strategy="epoch",
-    logging_dir="../logs",
-    load_best_model_at_end=True
+    load_best_model_at_end=True,
+    logging_dir="./logs",
+    fp16=torch.cuda.is_available()
 )
 
-# 🔹 Metrics
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = logits.argmax(axis=1)
-    return {
-        "accuracy": accuracy_score(labels, preds),
-        "f1": f1_score(labels, preds, average="weighted")
-    }
 
-# 🔹 Trainer
+# =========================
+# 10. TRAINER
+# =========================
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -99,13 +140,26 @@ trainer = Trainer(
     compute_metrics=compute_metrics
 )
 
-# 🔹 Train
+
+# =========================
+# 11. TRAIN
+# =========================
 trainer.train()
 
-# 🔹 Evaluate
+
+# =========================
+# 12. EVALUATE
+# =========================
 results = trainer.evaluate(test_dataset)
 print("Test Results:", results)
 
-# 🔹 Save model
-model.save_pretrained("../saved_model")
-tokenizer.save_pretrained("../saved_model")
+
+# =========================
+# 13. SAVE MODEL
+# =========================
+SAVE_PATH = "../saved_model"
+
+model.save_pretrained(SAVE_PATH)
+tokenizer.save_pretrained(SAVE_PATH)
+
+print(f"✅ Model saved to {SAVE_PATH}")
